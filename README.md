@@ -16,17 +16,13 @@ Users buy credits through a third-party payment provider and spend them on featu
 
 ## Environment
 
-This project provides a **mock payment provider**. Start it with Docker Compose:
-
-```bash
-docker compose up --build
-```
-
-No Docker? It's a single Python file with no dependencies:
+This project provides a **mock payment provider**. It's a single Python file with no dependencies (Python 3.8+):
 
 ```bash
 python3 services/payment-provider/provider.py
 ```
+
+Prefer Docker? `docker compose up --build` works too. The provider then reaches your service through `host.docker.internal`, so your service must listen on `0.0.0.0`, not `127.0.0.1` (some frameworks, such as uvicorn and Flask, default to `127.0.0.1`).
 
 | Service | Address | Description |
 |---------|---------|-------------|
@@ -122,7 +118,7 @@ This is the **minimum requirement**. Think about what a production-grade payment
 ```
 .
 ├── README.md                  ← You are here
-├── docker-compose.yml         ← One-command provider startup
+├── docker-compose.yml         ← Optional Docker startup for the provider
 ├── services/
 │   └── payment-provider/      ← Mock payment provider (:8090)
 └── wallet/                    ← Your working directory (currently empty)
