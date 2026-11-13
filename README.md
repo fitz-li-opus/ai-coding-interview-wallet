@@ -26,7 +26,7 @@ Prefer Docker? `docker compose up --build` works too. The provider then reaches 
 
 | Service | Address | Description |
 |---------|---------|-------------|
-| payment-provider | `http://localhost:8090` | Takes payments and sends webhooks to `http://localhost:8080/webhooks/payments` |
+| payment-provider | `http://localhost:8090` | Takes payments and sends webhooks to your service on port 8080 at `/webhooks/payments` |
 
 Verify it is running:
 
@@ -45,7 +45,7 @@ curl http://localhost:8090/health
 
 ### Webhooks
 
-The provider sends a `POST` with a JSON body to `http://localhost:8080/webhooks/payments`:
+The provider sends a `POST` with a JSON body to `/webhooks/payments` on port 8080 (`localhost:8080` when run with `python3`, `host.docker.internal:8080` under Docker):
 
 ```json
 {

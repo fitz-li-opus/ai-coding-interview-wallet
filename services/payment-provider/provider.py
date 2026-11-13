@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 import random
+import socketserver
 import threading
 import time
 import urllib.error
@@ -33,6 +34,14 @@ DELIVERY_TIMEOUT = 5
 payments = {}
 events = {}
 lock = threading.Lock()
+
+
+class Server(ThreadingHTTPServer):
+    # The stdlib server_bind() does a reverse DNS lookup (socket.getfqdn) that can
+    # hang for ~35s behind some VPN resolvers (e.g. Cloudflare WARP). Skip it.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def new_id(prefix):
@@ -168,5 +177,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    server = Server(("0.0.0.0", PORT), Handler)
     print(f"payment-provider listening on :{PORT}, delivering webhooks to {WEBHOOK_URL}")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    server.serve_forever()
