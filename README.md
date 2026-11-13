@@ -110,7 +110,7 @@ This is the **minimum requirement**. Think about what a production-grade payment
 
 - **Do NOT modify** any code under the `services/` directory
 - Write all of your code in the `wallet/` directory
-- Submit your code as a Pull Request when you're done
+- Work in your own fork of this repo. When you're done, open a Pull Request from your fork to this repo's `main` and fill in the PR template
 - The interviewer will watch your screen throughout. The focus is on **how you work with AI**, not just the final result
 
 ---
