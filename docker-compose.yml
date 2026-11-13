@@ -1,0 +1,16 @@
+services:
+  payment-provider:
+    build: ./services/payment-provider
+    ports:
+      - "8090:8090"
+    environment:
+      # Your wallet service runs on your machine, outside Docker
+      WEBHOOK_URL: http://host.docker.internal:8080/webhooks/payments
+      WEBHOOK_SECRET: whsec_interview_test
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
