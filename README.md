@@ -19,14 +19,16 @@ Users buy credits through a third-party payment provider and spend them on featu
 This project provides a **mock payment provider**. It's a single Python file with no dependencies (Python 3.8+):
 
 ```bash
-python3 services/payment-provider/provider.py
+python3 services/payment-provider/provider.py    # on Windows: python services/payment-provider/provider.py
 ```
 
-Prefer Docker? `docker compose up --build` works too. The provider then reaches your service through `host.docker.internal`, so your service must listen on `0.0.0.0`, not `127.0.0.1` (some frameworks, such as uvicorn and Flask, default to `127.0.0.1`).
+Prefer Docker? `docker compose up --build` works too. The provider then reaches your service through `host.docker.internal`. If webhooks don't arrive, make sure your service listens on `0.0.0.0` rather than `127.0.0.1`.
+
+**On Windows**, run the curl commands in this document from Git Bash or WSL. PowerShell and cmd don't accept the single-quoted JSON bodies, and in Windows PowerShell 5 `curl` is an alias for `Invoke-WebRequest`.
 
 | Service | Address | Description |
 |---------|---------|-------------|
-| payment-provider | `http://localhost:8090` | Takes payments and sends webhooks to `http://localhost:8080/webhooks/payments` |
+| payment-provider | `http://localhost:8090` | Takes payments and sends webhooks to your service on port 8080 at `/webhooks/payments` |
 
 Verify it is running:
 
@@ -45,7 +47,7 @@ curl http://localhost:8090/health
 
 ### Webhooks
 
-The provider sends a `POST` with a JSON body to `http://localhost:8080/webhooks/payments`:
+The provider sends a `POST` with a JSON body to `/webhooks/payments` on port 8080 (`localhost:8080` when run with `python3`, `host.docker.internal:8080` under Docker):
 
 ```json
 {
