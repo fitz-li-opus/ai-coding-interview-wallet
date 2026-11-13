@@ -107,14 +107,16 @@ class Handler(BaseHTTPRequestHandler):
         if not length:
             return {}
         try:
-            return json.loads(self.rfile.read(length))
+            body = json.loads(self.rfile.read(length))
         except json.JSONDecodeError:
             return None
+        return body if isinstance(body, dict) else None
 
     def do_GET(self):
-        if self.path == "/health":
+        path = self.path.split("?")[0].rstrip("/")
+        if path == "/health":
             return self._send(200, {"status": "healthy", "service": "payment-provider"})
-        if self.path == "/events":
+        if path == "/events":
             with lock:
                 return self._send(200, {"data": list(events.values())})
         self._send(404, {"error": "not found"})
@@ -124,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if parts == ["payments"]:
             body = self._body()
-            if not body or not body.get("user_id") or not isinstance(body.get("amount_cents"), int) or body["amount_cents"] <= 0:
+            if not body or not body.get("user_id") or type(body.get("amount_cents")) is not int or body["amount_cents"] <= 0:
                 return self._send(400, {"error": "user_id and positive integer amount_cents are required"})
             payment = {
                 "id": new_id("pay"),
