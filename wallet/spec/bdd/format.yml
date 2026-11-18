@@ -1,0 +1,872 @@
+# format.yml — BDD Step Pattern Registry (credit wallet)
+#
+# ONE surface. Every scenario in this project is driven programmatically — an
+# HTTP call to the wallet, an HTTP call to the payment provider, a worker pass —
+# so `spec/bdd/api/` is the whole suite and there is no `spec/bdd/e2e/`.
+#
+# That is not a shortcut. RealSpec's split is WHO DRIVES the scenario, not which
+# protocol it speaks, and this system has no human-driven surface to drive: no
+# browser, no CLI product, no native app. The README's deliverable is a curl
+# demo, and a curl demo is a document — the same facts these features assert,
+# written for a reader. Giving it a `.feature` file and a shell driver would add
+# a second place where those facts live, and a vocabulary (`run "<command>"`,
+# `stdout contains "<text>"`) whose only job is to restate them. If this wallet
+# ever grows a dashboard, that is when `spec/bdd/e2e/` is earned, and minimart's
+# locator grammar is what it should be written in.
+#
+# All step patterns are fully anchored (^ … $) and match the full step text
+# after the Gherkin keyword (Given / When / Then / And / But) is stripped.
+#
+# Cucumber step definitions are keyword-agnostic, so `keywords` has no effect
+# when the tests run. The validator enforces it: a step written under a keyword
+# not listed here is reported, which keeps the vocabulary reading the same way
+# in every feature.
+#
+# Capture groups are listed in order of appearance in the pattern.
+#
+# ── What is under test, and what is a counterparty ──────────────────────────
+#
+# The wallet is the system under test. The payment provider is not a stub of
+# ours: it is `services/payment-provider/provider.py`, the file the interview
+# ships, which the README forbids modifying — and this suite does not modify it.
+# It is CONFIGURED, which is a different act: `WEBHOOK_URL`, `WEBHOOK_SECRET`,
+# `DUPLICATE_RATE` and `PORT` are read from its environment, and a scenario's
+# stack sets them. That distinction is what lets the end-to-end paths run
+# against the real counterparty while the results stay deterministic.
+#
+# `DUPLICATE_RATE` is 0 in every scenario unless a tag says otherwise. The
+# provider's default is 0.3 — a coin flip after every successful delivery — and
+# a suite that leaves it there is a suite whose duplicate handling is asserted
+# 30% of the time. Duplicates are produced deliberately instead, by
+# `payment provider redelivers each event <n> times`, and the provider's own
+# random redelivery gets a scenario of its own with the rate pinned to 1.
+#
+# ── The division of labour: who may put a webhook in front of the wallet ────
+#
+# Four steps drive this integration and the line between them is the most
+# important rule in this file.
+#
+#   `payment provider creates a payment as "<var>":` and
+#   `payment provider refunds payment "<id>"` make the provider do what it
+#   does, including signing and delivering a webhook on its own schedule, with
+#   its own retries. A scenario whose claim is "the integration works" is
+#   written with these, and with nothing else. The webhook that credits the
+#   wallet in `credit.feature` was signed by the file the interview ships, or
+#   the claim would be about the harness.
+#
+#   `payment provider redelivers each event <n> times` is at-least-once made
+#   deterministic: the provider's own `POST /events/{id}/resend`, which is the
+#   Resend button of a provider dashboard, called n times for every event it
+#   has. The copies are released together. Still the provider's bytes, still
+#   the provider's signature.
+#
+#   `a webhook is delivered by the harness[, <variant>]:` is for what the
+#   provider cannot be asked for. It builds the event from its docstring, signs
+#   it with the shared secret the way the provider signs every attempt, and
+#   POSTs it. Three families of claim need it and no other step can state them:
+#     · ORDER. The README says events are not guaranteed to arrive in order and
+#       says nothing about when. A refund that lands before its credit is a
+#       sequence a scenario must be able to write, and the provider's threads
+#       will not be told.
+#     · SHAPE. An event type this wallet has never heard of, a payload with a
+#       field missing — the provider will never emit either, and both are
+#       things a wallet must survive rather than guess at.
+#     · FORGERY, with the variants below. No signature, a signature from
+#       another key, an amount raised after signing, a timestamp from an hour
+#       ago, a header that does not parse, a body that is not JSON.
+#
+#   A scenario that COULD have used the provider and used the harness instead
+#   is asserting that the harness and the wallet agree. That is the one way this
+#   registry can be made to lie, and it is a review rule rather than something
+#   the validator can see: `credit`, `dedupe` and `refund` go through the
+#   provider; `ordering`, `signature` and the malformed-payload cases are the
+#   harness's, and say why in the scenario.
+#
+# ── Stack tags ──────────────────────────────────────────────────────────────
+#
+# Tags configure a scenario's stack. They are not steps: nothing about them is
+# asserted, they are the arrangement a scenario runs in.
+#
+#   @webhooks:held       The provider's `WEBHOOK_URL` points at a sink that
+#                        answers 500, so no event reaches the wallet on its own
+#                        and the provider's retries exhaust harmlessly. The
+#                        premise is then provable rather than assumed —
+#                        `exactly 0 webhook deliveries were accepted` — which is
+#                        what makes "it never arrived" and "the refund came
+#                        first" sequences instead of races.
+#   @stack:duplicating `DUPLICATE_RATE=1`: the provider sends one extra copy
+#                        of every event, on its own schedule, the way it does
+#                        0.3 of the time in the interview's default
+#                        configuration.
+#
+# Untagged scenarios get the ordinary stack: postgres, the wallet, the provider
+# pointed at the wallet, `DUPLICATE_RATE=0`.
+#
+# ── Concurrency ─────────────────────────────────────────────────────────────
+#
+# One step arranges a race — `these things happen at one instant:` — and one
+# step reads what it produced, `exactly <n> responses are <status>`. An actor is
+# either an HTTP envelope naming its own method and path, or `{"step": "…"}`
+# naming another `When` step of this registry that takes no docstring. The
+# second form is the only way to race the actors that are not callers of the
+# wallet: a redelivery, a refund at the provider, a reconciliation pass, a
+# container going away.
+#
+# ── Deliberately absent ─────────────────────────────────────────────────────
+#
+# There is no `wait <n> seconds`. Webhook delivery is asynchronous and the
+# provider's retry schedule is its own business, so this suite waits on a
+# CONDITION — `background work has settled` — and never on a clock. A fixed
+# sleep that is long enough today is a flake tomorrow and a slow suite either
+# way.
+#
+# There is no step that reads a balance out of PostgreSQL in place of asking the
+# wallet for it, and none that writes a ledger entry in place of taking a
+# payment. Both already exist: `in PostgreSQL query returns <n> rows:` asserts
+# the rows, `GET /wallets/<user>` asserts the answer, and a scenario that wants
+# credits gets them the way credits are got.
+#
+# There is no step registered here that no scenario uses. A registered step is
+# an implemented step, and an implementation no scenario runs is unverified code
+# wearing the badge of a verified one; `realspec validate` fails on it.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTEXT VARIABLES
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# `provided` names the variables every scenario starts with. Every other {name}
+# a step writes must be saved earlier in the same scenario by a step that
+# declares `produces` — here, `payment provider creates a payment as "<var>":`
+# and `save response body field "<field>" as "<var>"`.
+
+context_variables:
+
+  # There are none. Nothing in this domain is a credential a scenario has to be
+  # given: the wallet has no authentication (the README gives it none, and its
+  # one endpoint with a trust boundary authenticates its caller by signature),
+  # and every identifier a scenario needs — a payment id, an event id — is
+  # minted by the provider while the scenario runs. A pre-provided value here
+  # would be a fact invented by the harness and then asserted as though the
+  # system had produced it.
+  provided: {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP DEFINITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+steps:
+
+  # ── Infrastructure Setup ────────────────────────────────────────────────────
+
+  - id: run_migration
+    keywords: [Given, And]
+    pattern: "^run migration$"
+    docstring: ~
+    description: >
+      Applies every migration in wallet/migrations to this scenario's database
+      (DDL only, no seed data) and leaves it at the latest version.
+      Must be the first step in every Background.
+      Fails the scenario if any migration errors; the database is per-scenario,
+      so it never has to be idempotent against an existing schema.
+
+  - id: exec_postgresql
+    keywords: [Given, And]
+    pattern: "^in PostgreSQL:$"
+    docstring:
+      type: sql
+      content_pattern: "^(?!\\s*$)[\\s\\S]+$"
+    description: >
+      Executes the docstring as raw SQL DML against this scenario's database, as
+      a single statement batch, outside any explicit transaction. Used for
+      seeding and for mutating seeded state mid-scenario. Any SQL error fails
+      the scenario immediately with the driver's message.
+      A wallet is only ever seeded CONSISTENTLY — a `wallets` row together with
+      the `wallet_entries` rows that sum to its balance — because
+      `balance = sum(amount)` is an invariant this system claims, and a fixture
+      that breaks it tests a system nobody shipped. Scenarios about credits
+      arriving do not seed at all; they take a payment.
+
+  - id: postgresql_query_returns
+    keywords: [Then, And]
+    pattern: "^in PostgreSQL query returns ([0-9]+) rows?:$"
+    captures:
+      - name: rowCount
+        pattern: "[0-9]+"
+        description: >
+          Expected row count. 0 asserts no matching record exists.
+          1 asserts exactly one record. Values > 1 assert at least N rows, so a
+          query whose claim is "exactly three" says so itself with
+          `HAVING count(*) = 3`.
+    docstring:
+      type: sql
+      must_match: "^\\s*[Ss][Ee][Ll][Ee][Cc][Tt]\\b"
+      must_match_message: SQL in a query-assertion step must begin with SELECT
+      content_pattern: "^(?!\\s*$)\\s*SELECT\\s[\\s\\S]+$"
+      # Documentation only: how the validator treats these tokens is declared
+      # in the top-level `substitutions` list.
+      special_values:
+        - token: "'{[a-z][a-zA-Z0-9]+}'"
+          description: >
+            Context variable in a SQL single-quoted literal.
+            Replaced at runtime (e.g. '{paymentId}' → 'pay_1a2b…').
+    description: >
+      Runs the SQL SELECT against this scenario's database and asserts the
+      number of rows returned. The query must begin with SELECT; a DML statement
+      here is a violation reported by realspec validate, not a runtime error.
+      This step carries the assertion the whole suite exists for. The README
+      asks that an overspend "returns a 4xx and changes nothing", and a status
+      code cannot say the second half: a wallet that deducts the credits and
+      then refuses answers 422 exactly as convincingly as one that refuses and
+      writes nothing. `in PostgreSQL query returns 0 rows:` is where the
+      difference lives, and every refusal in these features is followed by it.
+      Fails printing the expected and actual counts and the query as executed
+      after context-variable substitution.
+
+  # ── The wallet: HTTP Request ────────────────────────────────────────────────
+
+  - id: http_request
+    keywords: [When, And]
+    pattern: "^(GET|POST|PUT|PATCH|DELETE) (/[a-zA-Z0-9/{}:._?=&%-]*):$"
+    captures:
+      - name: method
+        pattern: "GET|POST|PUT|PATCH|DELETE"
+        description: HTTP method (uppercase).
+      - name: path
+        pattern: "/[a-zA-Z0-9/{}:._?=&%-]*"
+        description: >
+          Absolute path on the wallet, query string allowed. There is no
+          `/api/v1` prefix because the interview's contract has none: the paths
+          are `/webhooks/payments`, `/wallets/{user_id}`,
+          `/wallets/{user_id}/spend`, `/wallets/{user_id}/entries` and
+          `/health`, spelled exactly that way. {camelCase} segments are
+          substituted from the scenario's context variables, and a literal
+          segment written where the contract declares a `{param}` is how a
+          feature names a real user or payment.
+          Every method and path must exist under `spec/openapi` — see the
+          binding below. Both documents in that folder are read, so the
+          provider's own paths resolve as well; that is a property of the
+          validator's index and not a licence. This step addresses the WALLET.
+          The provider is driven by the four steps that name it, because a
+          reader must be able to tell which side of the wire a `When` is on.
+    openapi:
+      method: method
+      path: path
+    docstring:
+      type: json
+      allowed_top_level_keys: [headers, body]
+      schema:
+        headers:
+          required: false
+          key_pattern: "^[A-Z][A-Za-z0-9]*(?:-[A-Z][A-Za-z0-9]*)*$"
+          description: >
+            Optional request headers in HTTP canonical form. `Idempotency-Key`
+            and `X-Request-Id` are written here. A webhook signature is never
+            written here: no step of this registry sends one by hand, which is
+            what makes every "the wallet verified it" assertion mean something.
+        body:
+          required: false
+          description: >
+            Optional JSON request body. No body is sent when the key is absent
+            or its value is {} or null, so a GET may use an empty {} docstring.
+      content_pattern: "^(?!\\s*$)[\\s\\S]+$"
+    description: >
+      Sends one HTTP request to this scenario's wallet and records the response
+      for the assertion steps that follow. The client keeps NO COOKIE JAR and
+      follows no redirects: the next request sends exactly the headers its own
+      docstring writes. Transport errors fail the step; any HTTP status, 5xx
+      included, is recorded and left to `response status is`. Records one
+      response and clears any recorded set.
+
+  - id: requests_concurrent
+    keywords: [When]
+    pattern: "^these things happen at one instant:$"
+    docstring:
+      type: json
+      schema:
+        "[]":
+          required: true
+          description: >
+            A JSON ARRAY of actors, at least two. One element is one actor, and
+            an element is EITHER an envelope carrying its own "method" and
+            "path" as well as the optional "headers" and "body" http_request
+            takes — a caller of this scenario's wallet — OR
+            {"step": "<the sentence of a step in this registry>"}, which is
+            anything else this registry can already do.
+            A named step must be one this registry declares with `When` and
+            with no docstring of its own: an action, with no body to carry. That
+            rule is what keeps this closed — the set of things nameable here is
+            exactly the registry — and it excludes this step from naming itself,
+            because this step has a docstring. In this registry the nameable
+            steps are `payment provider refunds payment "<id>"`,
+            `payment provider redelivers each event <n> times`,
+            `the reconciler runs` and `service "<name>" is <state>`.
+      content_pattern: "^(?!\\s*$)[\\s\\S]+$"
+    step_ref:
+      key: step
+      keywords: [When]
+      docstring: none
+    description: >
+      The one way this registry arranges a race. It builds every actor, parks
+      them all at a gate and releases them together — an HTTP caller onto a
+      single write, a named step onto its own first effect — which is the
+      closest a race can be arranged from outside the service.
+      A named step is not a second way to do what an envelope does: it is the
+      only way to race the actors that are NOT callers of the wallet, and two of
+      those matter here. A redelivered webhook is one: nothing but the delivery
+      steps may sign a webhook, so an envelope could never be one. A
+      reconciliation pass is the other, because it is a one-shot command rather
+      than a request. Two appliers of one event at one instant is the race this
+      system is most likely to lose, and without this step it could not be
+      stated at all.
+      Every rule of http_request holds per element: each path must exist in the
+      OpenAPI documents, {camelCase} segments are substituted, the headers are
+      the ones the element writes, and any status is recorded. No element may
+      save a context variable: what a race produces is read afterwards, by the
+      assertions.
+      What the step cannot do for a scenario is warm the WALLET. A service that
+      takes a database connection per in-flight request has none open on its
+      first burst, and a caller still opening one is a caller that is not in the
+      race — so a scenario whose race must be real fires a concurrent read
+      (`GET /health`) first, in the same step, and says why.
+      The responses are recorded as a SET, in element order — the union of what
+      every actor produced, so an envelope's own response and the answers a
+      named redelivery collected are counted by the same
+      `exactly <n> responses are <status>`. An actor that produces no response
+      at all, such as a reconciliation pass or a container being stopped,
+      contributes nothing to the set and fails the step if it fails. The single
+      recorded response is cleared.
+
+  # ── The wallet: Response Assertions ─────────────────────────────────────────
+
+  - id: response_status
+    keywords: [Then, And]
+    pattern: "^response status is ([1-5][0-9]{2})$"
+    captures:
+      - name: statusCode
+        pattern: "[1-5][0-9]{2}"
+        description: Expected HTTP status code in range 100–599.
+    docstring: ~
+    description: >
+      Asserts the status code of the most recent HTTP response. Three steps
+      record one: `http_request` (the wallet's answer),
+      `a webhook is delivered by the harness…:` (the wallet's answer to that
+      delivery) and `payment provider creates a payment as "<var>":` (the
+      PROVIDER's 201). Two steps deliberately record nothing, and this step
+      fails after them rather than reading a stale answer:
+      `payment provider redelivers each event <n> times`, because there the
+      provider is the HTTP client and its results are read from its own log by
+      `exactly <n> webhook deliveries were (accepted|refused)`; and
+      `payment provider refunds payment "<id>"`, for the reason given at that
+      step.
+      On mismatch the failure message includes the actual status and the
+      response body, because a wrong status is almost always explained by it.
+
+  - id: response_set_status_count
+    keywords: [Then, And]
+    pattern: "^exactly ([0-9]+) responses? (?:is|are) ([1-5][0-9]{2})$"
+    captures:
+      - name: count
+        pattern: "[0-9]+"
+        description: >
+          Exact number of responses in the set that must carry the status.
+          0 asserts none did.
+      - name: statusCode
+        pattern: "[1-5][0-9]{2}"
+        description: Expected HTTP status code in range 100–599.
+    docstring: ~
+    description: >
+      Asserts how many of the responses in the last recorded SET carried this
+      status. One step records a set: `these things happen at one instant:`.
+      The count is EXACT:
+      "one of the four spenders got a 200" is the whole claim a race makes, and
+      an "at least" form would pass on the overspend it exists to catch.
+      Fails printing the distribution actually observed — every status, how many
+      responses carried it and one of their bodies.
+      Fails if no step in this scenario recorded a set.
+
+  - id: response_body_contains
+    keywords: [Then, And]
+    pattern: "^response body contains:$"
+    docstring:
+      type: json
+      content_pattern: "^(?!\\s*$)[\\s\\S]+$"
+      # Documentation only: how the validator treats these tokens is declared
+      # in the top-level `substitutions` list.
+      special_values:
+        - token: "\"<non-null>\""
+          description: >
+            Asserts the field is present in the response and its value is not
+            JSON null, without constraining its type or content. It is how a
+            scenario names a value the SYSTEM minted — a ledger entry's provider
+            event id, a timestamp — instead of pretending to know it.
+        - token: "\"{[a-z][a-zA-Z0-9]+}\""
+          description: >
+            Context variable resolved at runtime from the scenario's state bag
+            (e.g. "{paymentId}" is the id the provider minted).
+    description: >
+      Performs a partial JSON match against the most recent response body: only
+      the keys present in the docstring are checked, and additional keys in the
+      actual response are ignored. Nested objects match recursively by the same
+      rule; arrays match element-wise and the lengths must be equal — so a
+      docstring listing two ledger entries asserts that there are exactly two,
+      in that order.
+      A number in the docstring matches only a JSON number in the response, so
+      `"balance": 500` fails against `"500"`. That is this project's
+      money-is-an-integer claim as the API states it: credits are counted, never
+      measured, and a balance that arrives as a string or a float is a different
+      contract.
+      Fails naming the first path that is missing or unequal, and prints the
+      actual body. Fails if the response body is not valid JSON.
+
+  - id: response_body_does_not_contain
+    keywords: [Then, And]
+    pattern: "^response body does not contain \"([^\"]+)\"$"
+    captures:
+      - name: text
+        pattern: "[^\"]+"
+        description: >
+          Text that must be absent from the raw response body, at any nesting
+          level, as a key or inside a value. Used to prove that a refusal is not
+          an oracle — a rejected webhook is not told what the signature should
+          have been — and that an answer is not a table dump.
+    docstring: ~
+    description: >
+      Asserts that the given text does not appear anywhere in the raw response
+      body. Fails printing the surrounding fragment where the text was found.
+
+  - id: response_header_contains
+    keywords: [Then, And]
+    pattern: "^response header \"([^\"]+)\" contains \"([^\"]+)\"$"
+    captures:
+      - name: header
+        description: HTTP header name (e.g. "Content-Type", "X-Request-Id").
+      - name: substring
+        description: Expected substring of the header value.
+    docstring: ~
+    description: >
+      Asserts that a header of the most recent response contains the given
+      substring. The header name is looked up case-insensitively; the value is
+      matched as a case-sensitive substring. When the header occurs more than
+      once the assertion passes if ANY occurrence contains the substring.
+      Fails if the header is absent, listing the headers present.
+
+  - id: save_response_body_field
+    keywords: [Then, And]
+    pattern: "^save response body field \"([a-zA-Z_][a-zA-Z0-9_]*)\" as \"([a-z][a-zA-Z0-9]+)\"$"
+    produces: varName
+    captures:
+      - name: field
+        description: Top-level JSON field name in the most recent response body.
+      - name: varName
+        description: >
+          Context variable name; usable afterwards as {varName} inside JSON and
+          SQL docstrings and inside the step text of the steps whose captures
+          admit it.
+    docstring: ~
+    description: >
+      Reads the named top-level field from the most recent response body and
+      stores its value, rendered as a string, in the scenario's context bag.
+      Numbers are stored without quotes or exponent (1 → "1"), so the variable
+      can be interpolated into SQL as well as JSON.
+      Fails if the body is not a JSON object, if the field is absent, or if its
+      value is null.
+
+  # ── The payment provider: driving the counterparty ──────────────────────────
+
+  - id: provider_creates_payment
+    keywords: [Given, When, And]
+    pattern: "^payment provider creates a payment as \"([a-z][a-zA-Z0-9]+)\":$"
+    produces: varName
+    captures:
+      - name: varName
+        description: >
+          Context variable that the created payment's `id` is saved as — the
+          `pay_…` the provider minted, which every later assertion names as
+          {varName} in SQL and JSON.
+    docstring:
+      type: json
+      schema:
+        user_id:
+          required: true
+          description: Whose wallet the credits are for.
+        amount_cents:
+          required: true
+          description: >
+            A positive integer number of cents. One cent buys one credit, so
+            this is also the number of credits the webhook will carry.
+      content_pattern: "^(?!\\s*$)[\\s\\S]+$"
+    description: >
+      Calls `POST /payments` on this scenario's payment provider — the real
+      `services/payment-provider/provider.py`, which the README forbids
+      modifying and this suite does not modify. The provider mints a payment,
+      answers 201 with it, and about a second later begins delivering a signed
+      `payment.succeeded` webhook on its own schedule, with its own retries.
+      It saves the id itself rather than leaving that to
+      `save response body field`, for one reason: the id is the only thing a
+      scenario ever needs from the provider's answer, and a step that is given a
+      name for it cannot be written without one. The provider's response is also
+      recorded as the single response, so a scenario may still assert
+      `response status is 201` — the created payment is the provider's claim,
+      not the wallet's, and nothing about the wallet is asserted here. Whether
+      the webhook arrived is a question for `background work has settled` and
+      the rows.
+      Why it is a step at all: `http_request` addresses the wallet and must keep
+      doing exactly that. A registry where the same sentence sometimes means
+      "ask the system under test" and sometimes "ask its counterparty" cannot be
+      read.
+
+  - id: provider_refunds_payment
+    keywords: [When, And]
+    pattern: "^payment provider refunds payment \"([^\"]+)\"$"
+    captures:
+      - name: paymentId
+        pattern: "[^\"]+"
+        description: >
+          The payment to refund, normally a {contextVar} saved by the step that
+          created it.
+    docstring: ~
+    description: >
+      Calls `POST /payments/{id}/refund` on the provider. It refunds in full —
+      there is no amount parameter, so partial refunds do not exist in this
+      domain — and then delivers a signed `payment.refunded` webhook the way it
+      delivered the first one.
+      It EXPECTS the provider to accept the refund: a non-2xx answer fails the
+      step, and no response is recorded for the assertions.
+      That is a gap in this vocabulary, recorded here rather than papered over.
+      The provider refuses a second refund of the same payment with `409` and an
+      unknown payment with `404`, and no sentence in this registry can assert
+      either — a scenario about the PROVIDER's own guard cannot be written
+      today. It was left that way on purpose: the rule that matters to the
+      wallet is not that the provider refuses twice, it is that the wallet is
+      safe when it does not, because one refund at the provider is still
+      delivered many times to us and the wallet's defence has to be its own. A
+      step added to assert the counterparty's own rule would buy a scenario
+      about the mock and widen a closed vocabulary to get it. If a scenario ever
+      genuinely needs it, the honest fix is to let this step record its
+      response, not to add a second refund step.
+      It cannot be an envelope of `http_request` for the same reason the step
+      above cannot: it is the counterparty acting, not the system under test.
+
+  - id: provider_redelivers
+    keywords: [When, And]
+    pattern: "^payment provider redelivers each event ([0-9]+) times?$"
+    captures:
+      - name: times
+        pattern: "[0-9]+"
+        description: >
+          How many extra copies of every event the provider has created to
+          deliver. The copies of one event are released together, at one
+          instant; 1 is an ordinary redelivery.
+    docstring: ~
+    description: >
+      Calls the provider's own `POST /events/{id}/resend` for every event it
+      holds, n times each — the Resend button of a provider dashboard, which is
+      also the shape of at-least-once delivery. The bytes and the signature are
+      the provider's; a resend is a single attempt with no retry loop of its
+      own, which is what makes the count exact.
+      This is how duplicates are produced in this suite, and why
+      `DUPLICATE_RATE` is 0 everywhere else: a wallet whose idempotency is
+      asserted by a 0.3 coin flip is a wallet whose idempotency is asserted
+      sometimes. No sequence of existing steps can express it — the provider is
+      the only thing that can redeliver its own event, and the harness forging a
+      copy would be asserting something else entirely.
+      This step records NO response, and that is deliberate: the deliveries it
+      causes are made by the PROVIDER as an HTTP client, not by the harness, so
+      what the wallet answered is the provider's observation and is read from
+      the provider's own log by
+      `exactly <n> webhook deliveries were (accepted|refused)`. A response
+      recorded here would invite `response status is` to assert from the wrong
+      side of the wire — and with n copies there is no single answer to assert
+      anyway.
+      The step returns once every resend it asked for has been attempted, so the
+      count that follows is settled. Fails if the provider holds no event.
+
+  - id: provider_deliveries_counted
+    keywords: [Then, And]
+    pattern: "^exactly ([0-9]+) webhook deliver(?:y|ies) (?:was|were) (accepted|refused)$"
+    captures:
+      - name: count
+        pattern: "[0-9]+"
+        description: >
+          Exact number of the provider's delivery attempts that ended that way,
+          counted from the start of the scenario.
+      - name: outcome
+        pattern: "accepted|refused"
+        description: >
+          accepted — the provider logged a 2xx for that attempt and stopped
+          retrying. refused — anything else: a 4xx, a 5xx, a timeout, or no
+          answer because the wallet was not there.
+    docstring: ~
+    description: >
+      Reads the provider's own `GET /events` attempt log — every event it
+      created and the status of every attempt it made — and asserts how many
+      attempts ended that way. EXACT.
+      It is the far side of the wire, and some claims can only be made from
+      there. `0 accepted` proves the premise of a `@webhooks:held` scenario: the
+      wallet has not seen this event, so what follows is a first delivery rather
+      than a duplicate. `1 accepted` says the provider stopped trying, which is
+      the only observable difference between a wallet that committed before
+      answering and one that answered first — the second kind loses a payment
+      the moment it crashes, and the provider is the only witness.
+      A `refused` count is exact only when the scenario caused the refusals: a
+      wallet that was down for a second may have been asked once or twice, and
+      the provider's retry schedule is 0, 1, 2, 4, 8 and 16 seconds, each with a
+      5-second timeout. So `refused` belongs after deliveries the scenario
+      performed itself — a redelivery into a stopped wallet, a forged copy — and
+      a scenario that counts the refusals of an automatic delivery is asserting
+      the clock. The `accepted` form has no such caveat: the provider stops at
+      the first 2xx.
+      Belongs after `background work has settled` whenever the attempts being
+      counted are ones the scenario did not perform itself.
+
+  - id: harness_webhook
+    keywords: [When, And]
+    pattern: "^a webhook is delivered by the harness(?:, (unsigned|signed with the wrong secret|tampered after signing|with a stale timestamp|with a malformed signature header|with a malformed body))?:$"
+    captures:
+      - name: variant
+        pattern: "unsigned|signed with the wrong secret|tampered after signing|with a stale timestamp|with a malformed signature header|with a malformed body"
+        description: >
+          Optional; absent means the docstring is delivered correctly signed and
+          current, which is the form used for the claims about ORDER and SHAPE —
+          a refund before its credit, an event type that does not exist yet, a
+          payload with a field missing. Present, it is the harness breaking the
+          request in one of the ways the real provider cannot:
+          `unsigned` — no `Opus-Signature` header at all, the simplest attack on
+          an endpoint that mints credits.
+          `signed with the wrong secret` — a well-formed signature made with a
+          key nobody issued, which is what an attacker who knows the shape of
+          the payload has.
+          `tampered after signing` — the body's `credits` is raised AFTER the
+          signature is computed over the original. This is the attack the
+          endpoint exists to refuse, and the reason the signature must cover the
+          bytes the handler parses rather than ones it re-serialises.
+          `with a stale timestamp` — correctly signed, but `t` is backdated past
+          `WEBHOOK_TOLERANCE_SECONDS`. The only variant whose digest verifies,
+          and the only way to show the tolerance window is a window: every real
+          delivery carries a fresh `t`, so a wallet that ignores the timestamp
+          entirely passes every other scenario in this suite.
+          `with a malformed signature header` — `Opus-Signature` present but not
+          `t=…,v1=…`. A parser that throws here is a 500 where a 400 belongs.
+          `with a malformed body` — the signature is computed and then the body
+          is replaced by bytes that are not JSON. Because the digest still
+          matches what was sent, the refusal is about the body, which is how a
+          scenario states the order of operations: verify, then parse.
+    docstring:
+      type: json
+      schema:
+        id:
+          required: false
+          description: >
+            The event id, the wallet's idempotency key for this delivery.
+            Optional because "an event with no id" is itself a payload a wallet
+            must refuse rather than crash on.
+        type:
+          required: false
+          description: >
+            `payment.succeeded`, `payment.refunded`, or a type this wallet has
+            never heard of — which is the point of being able to write it.
+        created:
+          required: false
+          description: The provider's event timestamp, unix seconds.
+        data:
+          required: false
+          description: >
+            `{"payment": {id, user_id, amount_cents, credits, status}}`, the
+            provider's shape. No key is required by this registry: a payload
+            with a field missing is a case the wallet owes an answer to, and a
+            schema that refused to let a feature write it would move that answer
+            out of the spec and into a comment.
+      content_pattern: "^(?!\\s*$)[\\s\\S]+$"
+    description: >
+      Builds one webhook from the docstring, signs it with the shared
+      `WEBHOOK_SECRET` the way the provider signs every attempt, breaks it if a
+      variant says so, and POSTs it to `/webhooks/payments`. It RECORDS THE
+      WALLET'S ANSWER as the single response and returns once that answer has
+      arrived, so `response status is` reads it directly and no scenario using
+      this step waits for anything.
+      This is the harness speaking, and the three families of claim that need it
+      — order, shape, forgery — are set out at the top of this file along with
+      the rule that goes with it: a scenario that could have used the provider
+      and used this instead is asserting that the harness and the wallet agree,
+      which is the one way this registry can be made to lie. The variants are a
+      closed set for the same reason the vocabulary is.
+      It is one step rather than seven because the seven differ in nothing but
+      which byte is wrong, and a scenario that wants an honest delivery in a
+      chosen order wants the same step with no variant at all.
+
+  # ── Repair ──────────────────────────────────────────────────────────────────
+
+  - id: reconciler_runs
+    keywords: [When, And]
+    pattern: "^the reconciler runs$"
+    docstring: ~
+    description: >
+      Runs the reconciliation pass once, to completion. It lists the provider's
+      events with `GET /events`, finds the ones this wallet has no inbox row
+      for, and applies them in `created` order through the same path a delivered
+      webhook takes — the same inbox key, the same ledger write, the same single
+      transaction.
+      It exists because the provider gives up: six attempts over 31 seconds and
+      an event is gone, `POST /events/{id}/resend` is a button rather than a
+      mechanism, and the provider has no endpoint that answers "what is the
+      state of payment X" — `GET /events` is all there is to ask. A wallet
+      without this is a wallet whose balance is wrong until somebody notices.
+      A one-shot command rather than a loop, so that a scenario can say WHEN it
+      ran: that is what makes "it changed nothing" an assertion instead of a
+      hope, and it is why no sequence of other steps can stand in for it.
+
+  # ── Infrastructure Failure ──────────────────────────────────────────────────
+
+  - id: service_state
+    keywords: [Given, When, And]
+    pattern: "^service \"(wallet|postgres|payment-provider)\" is (stopped|started)$"
+    captures:
+      - name: service
+        pattern: "wallet|postgres|payment-provider"
+        description: >
+          A closed set of three, which is the whole deployment. `wallet` is in
+          it because at-least-once delivery is a recovery mechanism and not a
+          nuisance: a wallet that is gone when the webhook arrives must end up
+          with the credits anyway, and the only way to state that is to take the
+          wallet away while an event is in flight. `postgres` is in it because
+          the wallet's answer to losing its source of truth decides whether the
+          payment survives — a 5xx keeps the event alive at the provider, a 2xx
+          throws it away. `payment-provider` is in it because one claim
+          needs the counterparty to go away and come back with its memory
+          intact — it gives up after six attempts, and what repairs an event it
+          abandoned is a reconciliation pass reading its `GET /events`.
+      - name: state
+        pattern: "stopped|started"
+        description: >
+          stopped — the container is stopped, and the step returns once it is no
+          longer running. started — it is started again with the same
+          configuration and network aliases, and the step returns once it is
+          ready by the same wait strategy the stack used at startup.
+          NOTHING IS DESTROYED BY A STOP. Postgres keeps its data directory, so
+          a restart is a restart and not a reset — which is what makes "the
+          balance is still there" a statement about durability. The provider is
+          SUSPENDED rather than killed, and that is load-bearing: its payments
+          and its event log live in process memory with no persistence at all,
+          so a container that was recreated would come back having never taken a
+          payment, and every claim about repairing an event it abandoned would
+          be unwritable. Stopping it means that process stops answering;
+          starting it means the same process answers again, with the same events
+          and the same attempt log.
+    docstring: ~
+    description: >
+      Stops or starts one of this scenario's containers mid-scenario — fault
+      injection from outside, with no cooperation from the service and no
+      test-only code inside it.
+      Fails if the service is already in the requested state, because a scenario
+      that thinks it caused an outage and did not is asserting nothing.
+
+  - id: background_work_settled
+    keywords: [When, Then, And]
+    pattern: "^background work has settled$"
+    docstring: ~
+    description: >
+      Waits until nothing is in flight between the provider and the wallet, then
+      returns. Asserts nothing on its own: it is the condition that makes the
+      NEXT step a statement about a settled system rather than about a race.
+      Two things must hold at once, both read from the provider's own
+      `GET /events`:
+        · every event the provider has created has an attempt whose status was
+          2xx, or has exhausted its six attempts
+        · no further attempt is scheduled, including the extra copy that
+          `@stack:duplicating` promises for every event
+      Polled every 50 ms. The bound is the provider's own schedule — six
+      attempts at 0, 1, 2, 4, 8 and 16 seconds, each with a 5-second timeout —
+      plus a margin, so a wallet that is merely slow fails here rather than
+      intermittently in the assertion below.
+      Every scenario that asserts the effect of a delivery it did not perform
+      itself waits here first. A scenario that performed the delivery — a
+      harness webhook, a redelivery, both of which return once the wallet has
+      answered — does not need to, and says so by not writing it.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBSTITUTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Non-literal placeholders a docstring may legitimately contain, neutralised
+# before the docstring is parsed or matched so the validator does not reject
+# them. Each item names the docstring type it applies to (`in`), a JavaScript
+# regular expression (`match`, compiled without flags) and the LITERAL text that
+# replaces every match (`with`); items run in the order listed.
+#
+# This list is the single home of these facts: the `special_values` entries
+# above and the `docstring_types` patterns below describe the same tokens for
+# the reader, and are documentation only.
+
+substitutions:
+
+  # {contextVar} as a whole JSON string value, e.g. "{paymentId}".
+  - in: json
+    match: '"\{[a-z][a-zA-Z0-9]+\}"'
+    with: '"__ctx__"'
+
+  # The "assert present and not null" marker.
+  - in: json
+    match: '"<non-null>"'
+    with: '"__non_null__"'
+
+  # Scenario Outline <param> as a whole JSON string value, e.g. "<amount>".
+  - in: json
+    match: '"<[a-zA-Z][a-zA-Z0-9]*>"'
+    with: '"__outline__"'
+
+  # {contextVar} inside a SQL single-quoted literal, e.g. '{paymentId}'.
+  - in: sql
+    match: "'\\{[a-z][a-zA-Z0-9]+\\}'"
+    with: "'__ctx__'"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCSTRING TYPES
+# ─────────────────────────────────────────────────────────────────────────────
+
+docstring_types:
+
+  sql:
+    marker: "sql"
+    marker_pattern: "^sql$"
+    content_must_not_be_empty: true
+    context_var_pattern: "\\{[a-z][a-zA-Z0-9]+\\}"
+    context_var_delimiter: "single-quote"
+
+  json:
+    marker: "json"
+    marker_pattern: "^json$"
+    content_must_not_be_empty: true
+    must_be_valid_json_after_substitution: true
+    context_var_pattern: "\\{[a-z][a-zA-Z0-9]+\\}"
+    context_var_delimiter: "double-quote"
+    special_value_pattern: "\"<non-null>\""
+    outline_param_pattern: "\"<[a-zA-Z][a-zA-Z0-9]+>\""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENARIO OUTLINE SUBSTITUTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+outline_substitution:
+  token_pattern: "<([a-zA-Z][a-zA-Z0-9]*)>"
+  scope:
+    - step_text
+    - docstring
+  description: >
+    Tokens matching <columnName> in both step text and docstrings are replaced
+    with the corresponding column value from the Examples table before the step
+    definition receives the string. A race in this suite is a Scenario Outline
+    with a deliberately unused column, run three times: one instant observed
+    once is an anecdote.
+
+    A token in a JSON docstring must be written QUOTED ("<amount>"), because a
+    JSON docstring has to parse before the Examples table is applied
+    (must_be_valid_json_after_substitution) and a bare <amount> is not JSON. A
+    quoted token therefore reaches the step as a STRING even where the field is
+    numeric, so a step that sends such a docstring onward re-types exactly the
+    fields its contract declares as integers — never every string that happens
+    to look like a number, since a user_id of "123" is a string and guessing
+    from a value's shape is how an id silently becomes a number in the one
+    scenario nobody checks. The assertion side of the same convention already
+    held: a quoted scalar in `response body contains:` matches an unquoted one.
+    Today the whole coercion surface is one field, amount_cents in
+    `payment provider creates a payment as "<var>":`.

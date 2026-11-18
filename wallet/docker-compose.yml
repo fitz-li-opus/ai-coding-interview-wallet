@@ -1,0 +1,38 @@
+# Local development only. The BDD suite does NOT use this file: it starts its
+# own containers per scenario through testcontainers, so that one scenario can
+# never see another's rows.
+#
+# The payment provider is started by the repository root's compose file
+# (`docker compose up --build` there), unmodified. This one brings up the
+# database and the wallet and points the wallet at that provider.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+      POSTGRES_DB: wallet
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  wallet:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://wallet:wallet@postgres:5432/wallet?sslmode=disable
+      WEBHOOK_SECRET: whsec_interview_test
+      WEBHOOK_TOLERANCE_SECONDS: "300"
+      # The provider runs outside this compose project, on the host.
+      PROVIDER_BASE_URL: http://host.docker.internal:8090
+      MIGRATE_ON_START: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"

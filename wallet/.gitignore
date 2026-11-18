@@ -1,0 +1,13 @@
+# ── Go module checksums are a lock file, not build output ─────────────────────
+# The repository root ignores `go.sum` generically. For a Go implementation that
+# is wrong: without it `go mod download` cannot verify what it fetched and the
+# build stops being reproducible. These two un-ignore it for this directory and
+# everything under it (the service module and the BDD harness module).
+!go.sum
+
+# ── Build and test output ─────────────────────────────────────────────────────
+/bin/
+*.test
+*.out
+coverage.*
+__debug_bin*

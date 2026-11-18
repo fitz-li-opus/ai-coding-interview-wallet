@@ -1,0 +1,497 @@
+# openapi.yaml — the wallet's contract.
+#
+# Five operations, spelled exactly as the README spells them: no `/api/v1`
+# prefix, no version segment, no base path. Three of them are the interview's
+# minimum requirement; `/wallets/{user_id}/entries` and `/health` are the two
+# this design adds, and each says below why it exists.
+#
+# Two rules hold everywhere in this document.
+#
+# MONEY IS AN INTEGER. Every amount and every balance is `integer, format:
+# int64` — credits are counted, never measured. There is no `number` in this
+# file, and a balance that arrived as `500.0` would be a different contract.
+#
+# A REFUSAL CHANGES NOTHING. Every 4xx here is a refusal that writes no row:
+# not a ledger entry, not a wallet, not an idempotency record. That is the one
+# thing the README states explicitly ("returns a 4xx and changes nothing") and
+# the one thing a status code cannot say, so the scenarios assert it in SQL and
+# this document states which refusals are bound by it.
+
+openapi: 3.1.0
+
+info:
+  title: Credit wallet
+  version: "1.0.0"
+  description: >
+    Credits arrive from a third-party payment provider by webhook and are spent
+    on features in the product. The provider's delivery is at-least-once,
+    duplicated and unordered, so the whole of this service's correctness is in
+    three claims: an event is applied at most once, a 2xx is only sent after the
+    transaction has committed, and a spend never takes a balance below zero.
+
+    The ledger is the source of truth. `wallet_entries` is append-only — a
+    credit, a spend, a reversal — and a wallet's balance is the sum of its
+    entries, so every number this API returns can be explained by rows that were
+    never updated in place.
+
+servers:
+  - url: http://localhost:8080
+    description: >
+      The wallet binds `0.0.0.0:8080`, not `127.0.0.1`: under Docker the
+      provider reaches it as `host.docker.internal:8080`, and a service bound to
+      loopback is a service the webhooks never arrive at. No base path.
+
+tags:
+  - name: webhooks
+    description: The one endpoint with a trust boundary.
+  - name: wallets
+    description: Reading a balance, spending credits, reading the ledger.
+  - name: ops
+    description: Liveness.
+
+paths:
+
+  /webhooks/payments:
+    post:
+      tags: [webhooks]
+      operationId: receivePaymentWebhook
+      summary: Receive a payment event from the provider
+      description: >
+        The endpoint the whole service turns on, and the only one whose caller
+        is authenticated — by signature, because the provider has no account
+        here and the README gives the wallet no credentials of its own.
+
+        Four rules, each with a scenario that removes it:
+
+        · VERIFY FIRST. The signature is checked over the raw bytes before the
+        body is parsed and before anything is written. A body nobody signed with
+        `WEBHOOK_SECRET` changes nothing at all.
+
+        · APPLY ONCE. The event id is the primary key of the inbox, written in
+        the same transaction as the ledger entry. The same event delivered three
+        times, or four times at one instant, credits once. Deduplication is by
+        EVENT id and not by payment id, because the `payment.succeeded` and
+        `payment.refunded` of one payment share a payment id and must both land.
+
+        · ACKNOWLEDGE AFTER COMMITTING. A 2xx is the provider throwing the event
+        away, so it is written only once the transaction has committed. Anything
+        unresolved — no database, a crash, an answer that never got there —
+        leaves a non-2xx and the provider delivers again. At-least-once is the
+        recovery mechanism, not a nuisance to be tolerated.
+
+        · ORDER IS NOT PROMISED. A refund may arrive before its credit. Entries
+        are commutative, so the refund is applied as a reversal when it arrives
+        and the balance may be negative until the credit lands. Nothing is
+        parked and nothing is guessed.
+
+        An event whose `type` this wallet does not know is recorded, answered
+        2xx, and applied to nothing. The alternative is six retries and a
+        provider that gives up on an event this wallet was never going to act
+        on.
+      parameters:
+        - $ref: './payment-provider.yaml#/components/parameters/OpusSignature'
+      requestBody:
+        required: true
+        description: >
+          The provider's event, verbatim. The schema lives in the provider's own
+          document because the provider defines this wire format; restating it
+          here would be a second home for one fact.
+        content:
+          application/json:
+            schema:
+              $ref: './payment-provider.yaml#/components/schemas/WebhookEvent'
+      responses:
+        '200':
+          description: >
+            The event has been applied, or was a duplicate of one already
+            applied, or was of a type this wallet ignores. In every case the
+            provider may stop: the transaction committed before this answer was
+            written. The body is informational — the provider does not read it —
+            and names which of the three happened, so that a human replaying a
+            delivery by hand can tell a duplicate from a first application.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '400':
+          description: >
+            Refused, and nothing was written. `SIGNATURE_INVALID` covers a
+            missing, unparsable, wrong-key or post-signature-tampered request;
+            `SIGNATURE_TIMESTAMP_OUT_OF_RANGE` a digest that verifies but whose
+            `t` is older than `WEBHOOK_TOLERANCE_SECONDS` (300);
+            `INVALID_PAYLOAD` a correctly signed body that is not JSON or is
+            missing a field the event needs.
+            The body never echoes the expected digest, a prefix of it, or the
+            secret: a refusal that tells an attacker what the signature should
+            have been is an oracle, and the scenarios assert its absence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                signatureInvalid:
+                  value: { error: SIGNATURE_INVALID }
+                timestampOutOfRange:
+                  value: { error: SIGNATURE_TIMESTAMP_OUT_OF_RANGE }
+                invalidPayload:
+                  value: { error: INVALID_PAYLOAD }
+        '503':
+          description: >
+            The wallet could not reach its database, so it does not know whether
+            the event was applied and says so. This is the answer that keeps the
+            payment alive: the provider retries, and the credits arrive when the
+            database does. A 2xx here would lose them.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                unavailable:
+                  value: { error: STORAGE_UNAVAILABLE }
+
+  /wallets/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [wallets]
+      operationId: getWallet
+      summary: Read a balance
+      description: >
+        Answers for any user id, including one that has never been seen, and
+        creates nothing while doing so. A wallet is implied by its entries: a
+        user with no entries has a balance of 0, which is the truth, and a 404
+        would make a reader ask the provider whether the payment existed.
+        Reading is strongly consistent with the webhook: an event answered 2xx
+        is in the balance by the time that answer was written.
+      responses:
+        '200':
+          description: The balance now.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '503':
+          description: >
+            The database could not be reached. A read has no cached answer to
+            give and will not invent one; `/health` stays up so an operator can
+            tell the difference between this service being gone and its storage
+            being gone.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { error: STORAGE_UNAVAILABLE }
+
+  /wallets/{user_id}/spend:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [wallets]
+      operationId: spendCredits
+      summary: Spend credits
+      description: >
+        Deducts `amount` and answers the new balance. The deduction is one
+        conditional write — the balance is not read, decided upon and then
+        written — so four spenders arriving at one instant against a balance of
+        100 produce exactly as many successes as the balance can pay for, and
+        the rest are refused having changed nothing.
+
+        A spend never takes a balance below zero. A REVERSAL may (see the
+        webhook), and a wallet in debt refuses every spend until a credit lifts
+        it out — which is why the refusal is about the balance being too low
+        rather than about the amount being too large.
+
+        `Idempotency-Key` is optional and honoured when present: a spend is a
+        client-initiated write over an unreliable network, and the only safe
+        retry is a keyed one. A refused spend does NOT consume its key — a key
+        burnt by a 4xx would turn one lost response into a credit the caller can
+        never spend.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SpendRequest'
+      responses:
+        '200':
+          description: >
+            Spent. The same shape `GET /wallets/{user_id}` answers, because a
+            caller that just spent wants exactly what a caller that just asked
+            wants. A replay of a stored idempotent answer is byte-identical to
+            the original, including this balance — it is the original answer,
+            not a recomputation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '400':
+          description: >
+            `amount` is absent, not an integer, or not strictly positive — zero
+            included, because a spend of nothing is a caller bug and a wallet
+            that accepts it hides one. Nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalidAmount:
+                  value: { error: INVALID_AMOUNT }
+        '422':
+          description: >
+            Refused, and nothing was written. `INSUFFICIENT_BALANCE` when the
+            balance cannot pay; `IDEMPOTENCY_KEY_REUSED` when the key has
+            already been used for a request with a different body — the two
+            different requests are not the same request, and replaying either
+            answer would be a lie.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                insufficientBalance:
+                  value: { error: INSUFFICIENT_BALANCE }
+                idempotencyKeyReused:
+                  value: { error: IDEMPOTENCY_KEY_REUSED }
+
+  /wallets/{user_id}/entries:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [wallets]
+      operationId: listWalletEntries
+      summary: Read the ledger
+      description: >
+        The audit trail, and the reason a balance is explainable rather than
+        merely stored. Every entry is append-only and names what caused it: a
+        credit and a reversal name the provider's payment and event, a spend
+        names neither because nothing at the provider caused it.
+
+        Oldest first, which is the order the wallet applied them in and the
+        order in which the running balance makes sense. It is a bonus endpoint,
+        and it is the one a demo uses to show that a duplicate webhook produced
+        one entry and not two.
+      responses:
+        '200':
+          description: The balance and the entries that sum to it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletLedger'
+        '503':
+          description: >
+            The database could not be reached. A read has no cached answer to
+            give and will not invent one; `/health` stays up so an operator can
+            tell the difference between this service being gone and its storage
+            being gone.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { error: STORAGE_UNAVAILABLE }
+
+  /health:
+    get:
+      tags: [ops]
+      operationId: health
+      summary: Liveness
+      description: >
+        Cheap and dependency-free: it answers while the database is down, which
+        is what makes it usable as the warm-up request a concurrency scenario
+        fires before a race (a caller still opening its first database
+        connection is a caller that is not in the race). It carries no
+        configuration and no secret.
+      responses:
+        '200':
+          description: The wallet is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+
+  parameters:
+
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      description: >
+        Whose wallet. Opaque and provider-defined: it is whatever `user_id` the
+        payment carried, and the wallet neither mints nor validates it beyond
+        requiring a non-empty path segment.
+      schema:
+        type: string
+        minLength: 1
+        examples: ["u_1"]
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >
+        A client-chosen key making one spend retry-safe. Scoped to the wallet
+        and to the request body: the same key with the same body replays the
+        stored answer, the same key with a different body is refused, and a key
+        that only ever accompanied a refusal is still free.
+      schema:
+        type: string
+        minLength: 1
+        examples: ["spend-7f3a1c2b"]
+        description: >
+          An opaque string, stored as given. There is deliberately no length
+          cap: a cap is a rule, a rule needs an error code and a scenario that
+          asserts it, and nothing here needs one.
+
+  schemas:
+
+    Wallet:
+      type: object
+      description: >
+        The answer to both "what is the balance" and "what is it now that I have
+        spent" — one shape, so there is one thing to learn.
+      required: [user_id, balance]
+      additionalProperties: false
+      properties:
+        user_id:
+          type: string
+          examples: ["u_1"]
+        balance:
+          type: integer
+          format: int64
+          description: >
+            Credits. No minimum: a reversal of credits that were already spent
+            leaves a wallet in debt, and reporting 0 there would be a balance
+            the ledger does not agree with. Spending is what refuses to go
+            below zero, not reporting.
+          examples: [500]
+
+    WalletLedger:
+      type: object
+      required: [user_id, balance, entries]
+      additionalProperties: false
+      properties:
+        user_id:
+          type: string
+          examples: ["u_1"]
+        balance:
+          type: integer
+          format: int64
+          description: The sum of `entries`, and the same number `GET /wallets/{user_id}` answers.
+          examples: [200]
+        entries:
+          type: array
+          description: Oldest first.
+          items:
+            $ref: '#/components/schemas/WalletEntry'
+
+    WalletEntry:
+      type: object
+      required: [kind, amount, payment_id, event_id]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [credit, spend, reversal]
+          description: >
+            `credit` — a payment succeeded. `spend` — the product charged the
+            user. `reversal` — a payment was refunded and the credits went back.
+            There is no `adjustment`: every entry in this system has a cause that
+            can be named.
+        amount:
+          type: integer
+          format: int64
+          description: >
+            Signed, and signed consistently: `credit` is positive, `spend` and
+            `reversal` are negative. The balance is the sum, so a reader never
+            has to know which kinds to add and which to subtract.
+          examples: [500]
+        payment_id:
+          type: [string, 'null']
+          description: >
+            The provider's payment, or null for a `spend` — nothing at the
+            provider caused it.
+          examples: ["pay_1a2b3c4d5e6f7a8b"]
+        event_id:
+          type: [string, 'null']
+          description: >
+            The provider's event that caused this entry, or null for a `spend`.
+            It is also the inbox key that made the entry exactly once, so a
+            duplicate delivery can be shown to have produced no second row.
+          examples: ["evt_8f3a1c2b9d4e5f60"]
+
+    SpendRequest:
+      type: object
+      required: [amount]
+      # Unknown fields are ignored rather than refused. Refusing them turns a
+      # client that sends a field this version has not heard of into a 400,
+      # which is a worse failure than ignoring it; `amount` is the only field
+      # that is read, and its type is enforced exactly.
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >
+            Credits to deduct: a strictly positive integer. `0`, a negative
+            number, a float and a numeric string are all refused with
+            `INVALID_AMOUNT` — the type is part of the contract, not a
+            convenience to be coerced.
+          examples: [100]
+
+    WebhookAck:
+      type: object
+      description: >
+        Informational. The provider reads only the status code, so this body
+        exists for the human replaying a delivery by hand.
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [applied, duplicate, ignored]
+          description: >
+            The outcome of THIS DELIVERY. `applied` — it wrote the ledger entry.
+            `duplicate` — the event had already been applied and this delivery
+            wrote nothing. `ignored` — the event was recorded and acted on in no
+            way, which is what an unknown type gets.
+            A delivery's outcome is not a row's outcome: the inbox is keyed by
+            event id, so a duplicate cannot insert a second row and the stored
+            outcome of an event is only ever `applied` or `ignored`. That a
+            duplicate changed nothing is shown by the entries it did not add and
+            by the provider's delivery log, never by a row saying so.
+
+    Health:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    Error:
+      type: object
+      description: >
+        Every refusal in this API. The code is stable and machine-readable
+        because a caller has to branch on it — a wallet whose "insufficient
+        balance" is a sentence is a wallet whose clients parse sentences.
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+          enum:
+            - SIGNATURE_INVALID
+            - SIGNATURE_TIMESTAMP_OUT_OF_RANGE
+            - INVALID_PAYLOAD
+            - INVALID_AMOUNT
+            - INSUFFICIENT_BALANCE
+            - IDEMPOTENCY_KEY_REUSED
+            - STORAGE_UNAVAILABLE
+          description: >
+            The machine-readable reason. No field carries a human message: the
+            scenarios assert this code, and a second, prose field would be a
+            second thing to keep true.

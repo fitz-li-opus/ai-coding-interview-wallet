@@ -125,3 +125,41 @@ This is the **minimum requirement**. Think about what a production-grade payment
 │   └── payment-provider/      ← Mock payment provider (:8090)
 └── wallet/                    ← Your working directory (currently empty)
 ```
+
+---
+
+## Implementation Notes
+
+> Added by the candidate. The implementation lives in [`wallet/`](./wallet) and nothing under
+> `services/` was touched — `git diff --stat HEAD -- services/` is empty.
+> Full detail: [`wallet/README.md`](./wallet/README.md) · design record: [`plan-wallet-go-postgres.md`](./plan-wallet-go-postgres.md)
+
+**Run it**
+
+```bash
+python3 services/payment-provider/provider.py        # provider on :8090
+cd wallet && docker compose up --build               # wallet + postgres on :8080
+```
+
+**Nine things worth knowing before you probe it.** Each one is a decision, not an accident, and
+each is asserted by a scenario in [`wallet/spec/bdd/api`](./wallet/spec/bdd/api).
+
+| | Behaviour | Why it is this way |
+|---|---|---|
+| 1 | **The webhook signature is verified and mandatory.** A hand-written `curl` to `/webhooks/payments` without a valid `Opus-Signature` gets `400` and writes nothing. To replay a real delivery, use the provider's `POST /events/{id}/resend` — it re-signs for you. | Without verification, anyone who knows the URL can credit themselves |
+| 2 | **Duplicates are acknowledged, not refused.** A redelivered event answers `200` and credits nothing a second time. The dedupe key is the **event id**, never the payment id. | A payment emits two events (`succeeded`, `refunded`) that share one payment id; deduping on that id would swallow the refund |
+| 3 | **`2xx` means the credits are committed.** Anything else — including `503` when the database is unreachable — is deliberate, so the provider keeps the event and retries. | An ack without a write is the one failure nothing can recover from |
+| 4 | **Insufficient balance answers `422 INSUFFICIENT_BALANCE` and writes nothing.** Not "nothing much" — zero ledger rows, balance unchanged, asserted in SQL. | The README's one explicit negative post-condition |
+| 5 | **`POST /wallets/{id}/spend` honours an optional `Idempotency-Key`.** Same key + same body replays the first answer byte for byte and spends once; same key + different body is refused `422 IDEMPOTENCY_KEY_REUSED`; a key that only ever accompanied a refusal stays free. | A spend is a client-initiated write over an unreliable network, and the only safe retry is a keyed one |
+| 6 | **A balance can be negative.** Refunding credits that were already spent leaves the wallet in debt, and `GET` reports it honestly. Spending is what refuses to go below zero, never the refund. | The credits really were returned; a ledger that refuses to say so is a ledger that lies |
+| 7 | **An unknown user answers `200` with `balance: 0` and creates no rows.** | Credits can arrive for a user this service has never seen; a `404` makes every caller write a pointless branch |
+| 8 | **An event type this service does not know is recorded, acknowledged, and acted on in no way.** | Answering `4xx` would make the provider redeliver the same event forever |
+| 9 | **The three endpoints have no authentication.** Anyone who can reach the service can spend anyone's credits. | Not in scope here, and stated rather than hidden — see Known Gaps in `wallet/README.md` |
+
+**Beyond the minimum**: an append-only ledger (`balance` always equals its sum), an event inbox for
+exactly-once crediting, refund handling, a reconciler for events the provider gave up delivering,
+`GET /wallets/{user_id}/entries`, `/health`, and `X-Request-Id` on every response.
+
+**Tests**: a machine-checked specification (10 Gherkin feature files, 72 scenarios / 83 runs) under
+[`wallet/spec/`](./wallet/spec), run against real containers — PostgreSQL, the service, and this
+repository's own unmodified payment provider. See `wallet/README.md` for how to run them.

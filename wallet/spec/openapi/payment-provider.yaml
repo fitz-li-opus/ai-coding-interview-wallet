@@ -1,0 +1,428 @@
+# payment-provider.yaml — the counterparty's contract.
+#
+# This document describes `services/payment-provider/provider.py`, the mock the
+# interview ships. The wallet is its CLIENT, so nothing here is ours to change:
+# the README forbids modifying that directory, and this file was written by
+# reading it. Where the README and the code disagree, the code wins and the
+# difference is noted.
+#
+# It is in `spec/openapi` for two reasons. The step implementations that drive
+# the provider — creating a payment, refunding one, resending an event, reading
+# the delivery log — are written against these operations, and the webhook the
+# wallet receives is declared here, under `webhooks`, because the provider is
+# the party that defines that wire format. The wallet's own contract refers to
+# this schema rather than restating it.
+#
+# NOTE for anyone reading a validation failure: the validator merges every
+# document under this folder into one index, so a path declared here resolves
+# for `http_request` as well. That is a property of the index, not a licence —
+# `http_request` addresses the wallet, and the provider is driven by the four
+# steps in `format.yml` that name it.
+
+openapi: 3.1.0
+
+info:
+  title: Mock payment provider (as shipped, read-only)
+  version: "1.0.0"
+  description: >
+    Takes payments, refunds them, and delivers signed webhooks to the wallet
+    at-least-once. Standard library only, in-memory state, no persistence: a
+    restart loses every payment and every event, which is why no scenario
+    restarts it except the one that asserts what reconciliation does when the
+    counterparty cannot be asked.
+
+servers:
+  - url: http://localhost:8090
+    description: >
+      The provider as `python3 services/payment-provider/provider.py` starts it.
+      Under Docker it is the same port on the compose network. There is no base
+      path, and no versioning: the paths below are spelled exactly as the
+      handler matches them.
+
+tags:
+  - name: payments
+    description: Taking and refunding money.
+  - name: events
+    description: What the provider has emitted, and what came of each attempt.
+
+paths:
+
+  /payments:
+    post:
+      tags: [payments]
+      operationId: createPayment
+      summary: Take a payment
+      description: >
+        Creates a succeeded payment and, about a second later, begins delivering
+        a signed `payment.succeeded` webhook to `WEBHOOK_URL` with retries. One
+        cent buys one credit, so `credits` equals `amount_cents`.
+        There is no idempotency mechanism here: calling this twice creates two
+        payments and two events, which is correct behaviour for a provider and
+        the reason the WALLET is the party that has to be idempotent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentRequest'
+      responses:
+        '201':
+          description: The payment, as the provider now holds it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '400':
+          description: >
+            `user_id` missing or empty, or `amount_cents` not a positive
+            integer. The provider checks the type strictly: a float or a numeric
+            string is refused.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderError'
+
+  /payments/{payment_id}/refund:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    post:
+      tags: [payments]
+      operationId: refundPayment
+      summary: Refund a payment in full
+      description: >
+        Marks the payment refunded and delivers a signed `payment.refunded`
+        webhook carrying a snapshot of it. There is no amount parameter, so
+        partial refunds do not exist in this domain.
+        The 409 below is the provider's own guard against refunding twice. It is
+        NOT a guarantee the wallet may lean on: one refund here is still
+        delivered many times to the wallet, so the wallet's defence against
+        applying it twice has to be its own.
+      responses:
+        '200':
+          description: The payment, now refunded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '404':
+          description: No such payment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderError'
+        '409':
+          description: Already refunded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderError'
+
+  /events/{event_id}/resend:
+    parameters:
+      - $ref: '#/components/parameters/EventId'
+    post:
+      tags: [events]
+      operationId: resendEvent
+      summary: Redeliver an event
+      description: >
+        The Resend button of a provider dashboard. Delivers the event once more,
+        in a thread, with NO retry loop of its own — which is what makes a
+        scenario's duplicate count exact. The event is unchanged and the
+        signature is recomputed with a fresh timestamp, exactly as every other
+        attempt is.
+      responses:
+        '202':
+          description: Accepted for redelivery.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [resent]
+                properties:
+                  resent:
+                    type: string
+                    description: The event id now being delivered again.
+                    examples: ["evt_8f3a1c2b9d4e5f60"]
+        '404':
+          description: No such event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderError'
+
+  /events:
+    get:
+      tags: [events]
+      operationId: listEvents
+      summary: Every event, with every delivery attempt
+      description: >
+        The provider's whole memory, and the only question it can be asked about
+        what happened. There is no `GET /payments/{id}`: a wallet that needs to
+        know whether a payment it never heard about exists has this endpoint and
+        nothing else, which is what reconciliation is written against.
+      responses:
+        '200':
+          description: All events, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EventRecord'
+
+  /health:
+    get:
+      tags: [events]
+      operationId: providerHealth
+      summary: Liveness
+      responses:
+        '200':
+          description: The provider is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, service]
+                properties:
+                  status:
+                    type: string
+                    examples: ["healthy"]
+                  service:
+                    type: string
+                    examples: ["payment-provider"]
+
+webhooks:
+
+  paymentWebhook:
+    post:
+      operationId: deliverPaymentWebhook
+      summary: What the provider sends the wallet
+      description: >
+        Delivered to `WEBHOOK_URL` — `/webhooks/payments` on the wallet — as
+        `POST` with `Content-Type: application/json`.
+
+        Three properties of this delivery are the wallet's whole problem, and
+        all three are the provider's documented behaviour rather than an
+        accident of this mock:
+
+        · AT-LEAST-ONCE. Any answer other than 2xx, or no answer within 5
+        seconds, is retried at 0, 1, 2, 4, 8 and 16 seconds and then abandoned.
+        A 2xx is the provider throwing the event away, so a wallet that answers
+        before it has committed loses the payment.
+
+        · DUPLICATED. After a successful delivery the provider may deliver the
+        same event again (`DUPLICATE_RATE`, 0.3 as shipped). The event id is the
+        only thing that distinguishes a duplicate from a new event.
+
+        · UNORDERED. Each event is delivered by its own thread with its own
+        retries, so `payment.refunded` can arrive before the
+        `payment.succeeded` of the same payment.
+
+        Every request is signed; see `OpusSignature`.
+      parameters:
+        - $ref: '#/components/parameters/OpusSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEvent'
+      responses:
+        '200':
+          description: >
+            Any 2xx means the receiver has taken responsibility for the event
+            and the provider stops. The body is not read.
+        '400':
+          description: >
+            Anything that is not 2xx is a failed attempt and will be retried on
+            the schedule above, including a refusal the receiver considers final.
+            A receiver that refuses a forged webhook therefore receives it again,
+            which is the correct cost of being an open endpoint.
+
+components:
+
+  parameters:
+
+    PaymentId:
+      name: payment_id
+      in: path
+      required: true
+      description: The provider's payment id, `pay_` followed by 16 hex characters.
+      schema:
+        type: string
+        pattern: '^pay_[0-9a-f]{16}$'
+        examples: ["pay_1a2b3c4d5e6f7a8b"]
+
+    EventId:
+      name: event_id
+      in: path
+      required: true
+      description: The provider's event id, `evt_` followed by 16 hex characters.
+      schema:
+        type: string
+        pattern: '^evt_[0-9a-f]{16}$'
+        examples: ["evt_8f3a1c2b9d4e5f60"]
+
+    OpusSignature:
+      name: Opus-Signature
+      in: header
+      required: true
+      description: >
+        `t=<unix timestamp>,v1=<hex digest>`, where the digest is
+        `HMAC-SHA256(secret, "<t>." + raw request body)` and the secret is
+        `WEBHOOK_SECRET` (`whsec_interview_test` in this interview).
+
+        Two details decide whether a verifier is correct. The digest covers the
+        RAW BYTES of the body, so a receiver that parses the JSON and
+        re-serialises it before verifying will reject honest deliveries. And `t`
+        is the time of THIS ATTEMPT, not of the event — it is recomputed for
+        every retry and for every resend — so a receiver may bound its age to
+        limit replay, but must not expect it to match `created`.
+      schema:
+        type: string
+        pattern: '^t=[0-9]+,v1=[0-9a-f]{64}$'
+        examples: ["t=1767225600,v1=4f1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"]
+
+  schemas:
+
+    CreatePaymentRequest:
+      type: object
+      required: [user_id, amount_cents]
+      additionalProperties: false
+      properties:
+        user_id:
+          type: string
+          minLength: 1
+          description: Whose wallet the credits are for.
+          examples: ["u_1"]
+        amount_cents:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >
+            Cents, a strictly positive integer. One cent buys one credit.
+
+    Payment:
+      type: object
+      required: [id, user_id, amount_cents, credits, status]
+      properties:
+        id:
+          type: string
+          examples: ["pay_1a2b3c4d5e6f7a8b"]
+        user_id:
+          type: string
+          examples: ["u_1"]
+        amount_cents:
+          type: integer
+          format: int64
+          examples: [500]
+        credits:
+          type: integer
+          format: int64
+          description: Equal to `amount_cents`; the provider mints one credit per cent.
+          examples: [500]
+        status:
+          type: string
+          description: >
+            `succeeded` or `refunded`. Left open rather than enumerated for the
+            same reason `WebhookEvent.type` is: see there.
+          examples: ["succeeded"]
+
+    WebhookEvent:
+      type: object
+      description: >
+        One event, exactly as it arrives at the wallet. This schema is the
+        wallet's request body too — `openapi.yaml` refers to it rather than
+        restating it, so the wire format has one home.
+      required: [id, type, created, data]
+      properties:
+        id:
+          type: string
+          description: >
+            The event id. It is the wallet's idempotency key: the same event
+            redelivered carries the same id, and the two events of one payment
+            (`succeeded`, then `refunded`) carry different ones. A receiver that
+            deduplicates on the PAYMENT id instead will silently drop the refund.
+          examples: ["evt_8f3a1c2b9d4e5f60"]
+        type:
+          type: string
+          description: >
+            `payment.succeeded` or `payment.refunded` today. Deliberately NOT an
+            enum: a provider's event types grow, the wallet has to answer for one
+            it has never heard of, and a contract that forbade writing one would
+            move that answer out of the specification.
+          examples: ["payment.succeeded"]
+        created:
+          type: integer
+          format: int64
+          description: >
+            When the provider created the event, unix seconds. Not the signature's
+            `t`, which belongs to the attempt, and the only ordering the provider
+            offers — reconciliation applies missed events in this order.
+          examples: [1767225600]
+        data:
+          type: object
+          required: [payment]
+          properties:
+            payment:
+              $ref: '#/components/schemas/Payment'
+
+    EventRecord:
+      type: object
+      description: >
+        An event as `GET /events` reports it: the event itself, plus the
+        provider's own log of what came of each attempt. The underscore in
+        `_attempts` is the provider's; it marks the field as the mock's
+        bookkeeping rather than part of the event.
+      required: [id, type, created, data]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        created:
+          type: integer
+          format: int64
+        data:
+          type: object
+          required: [payment]
+          properties:
+            payment:
+              $ref: '#/components/schemas/Payment'
+        _attempts:
+          type: array
+          description: One element per delivery attempt, in order.
+          items:
+            $ref: '#/components/schemas/DeliveryAttempt'
+
+    DeliveryAttempt:
+      type: object
+      required: [at, status]
+      properties:
+        at:
+          type: integer
+          format: int64
+          description: Unix seconds when the attempt finished.
+        status:
+          description: >
+            The HTTP status the receiver answered, as an integer — or a string
+            such as `error: URLError` when there was no answer at all, which is
+            what a stopped wallet looks like from here. A 2xx integer is the only
+            thing that counts as accepted.
+          oneOf:
+            - type: integer
+            - type: string
+          examples: [200]
+
+    ProviderError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: A human sentence; the provider has no error codes.
+          examples: ["payment not found"]
